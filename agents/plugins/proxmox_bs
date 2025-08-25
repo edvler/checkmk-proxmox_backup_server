@@ -77,15 +77,44 @@ jq -r '.[].name' "$TMP_DATASTORES" | while read -r name; do
   proxmox-backup-client login
 
   TMP_GC=$( mktemp -p /tmp/ )
-  printf '%s' "$TMP_GC" >> "$TMP_GC_FILES"
+  printf '%s\n' "$TMP_GC" >> "$TMP_GC_FILES" #Bugfix: newline
   command_section -t "$TMP_GC" -p "$name" \
     "proxmox-backup-manager garbage-collection status" "$name" $OUTPUT_FORMAT
   jq -r '.upid' "$TMP_GC" >> "$TMP_UPIDS"
-  command_section -p "$name" \
-    "proxmox-backup-client list" --repository "$PBS_REPOSITORY" $OUTPUT_FORMAT
-  command_section -p "$name" \
-    "proxmox-backup-client snapshot list" --repository "$PBS_REPOSITORY" \
-    $OUTPUT_FORMAT
+
+  #datastore root 
+  currlist="[]"
+  l=$(/bin/env proxmox-backup-client list --repository "$PBS_REPOSITORY" $OUTPUT_FORMAT)
+  currlist=$(jq -s 'add' <(echo $currlist) <(echo $l))
+
+  #datastore root 
+  currsnap="[]"
+  j=$(/bin/env proxmox-backup-client snapshot list --repository "$PBS_REPOSITORY" $OUTPUT_FORMAT)
+  currsnap=$(jq -s 'add' <(echo $currsnap) <(echo $j))
+
+
+  #store all namespaces in repository
+  TMP_NAMESPACE=$( mktemp -p /tmp/ )
+  ns=$(/bin/env proxmox-backup-client namespace list --repository "$PBS_REPOSITORY" --output-format text)
+
+  #loop over namespaces and concat all jsons from each namespace
+  echo "===proxmox-backup-client list===$name"
+  while IFS= read -r line; do
+     l=$(/bin/env proxmox-backup-client list --repository "$PBS_REPOSITORY" --ns $line $OUTPUT_FORMAT)
+     currlist=$(jq -s 'add' <(echo $currlist) <(echo $l))
+  done <<< "$ns"
+  echo $currlist
+
+  #loop over namespaces and concat all jsons from each namespace
+  echo "===proxmox-backup-client snapshot list===$name"
+  while IFS= read -r line; do
+     j=$(/bin/env proxmox-backup-client snapshot list --repository "$PBS_REPOSITORY" --ns $line $OUTPUT_FORMAT)
+     currsnap=$(jq -s 'add' <(echo $currsnap) <(echo $j))
+  done <<< "$ns"
+  echo $currsnap
+
+  rm -vf $TMP_NAMESPACE >&2
+
   command_section -p "$name" \
     "proxmox-backup-client status" --repository "$PBS_REPOSITORY" \
     $OUTPUT_FORMAT
@@ -103,7 +132,7 @@ export PBS_PASSWORD=
 echo "$TMP_GC_FILES" >> "$TMP_GC_FILES"
 
 # shellcheck disable=SC2086 disable=SC2046 disable=SC2002 disable=SC2153
-rm -vf $TMP_DATASTORE $TMP_UPIDS $(cat $TMP_GC_FILES | xargs) >&2
+rm -vf $TMP_DATASTORES $TMP_UPIDS $(cat $TMP_GC_FILES | xargs) >&2 #Bugfix: $TMP_DATASTORES
 
 echo "===EOD==="
 echo "="
