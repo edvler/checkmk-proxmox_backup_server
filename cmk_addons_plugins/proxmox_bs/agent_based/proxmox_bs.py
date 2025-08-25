@@ -17,11 +17,15 @@ from cmk.agent_based.v2 import (
     CheckPlugin,
     Metric,
     ServiceLabel,
+    render,
     get_value_store,
 )
 from cmk.plugins.lib.df import df_check_filesystem_single, FILESYSTEM_DEFAULT_LEVELS
 import re
 import json
+
+import time
+from datetime import datetime
 
 proxmox_bs_subsection_start = re.compile("^===")
 proxmox_bs_subsection_int = re.compile("===.*$")
@@ -239,4 +243,299 @@ check_plugin_proxmox_bs = CheckPlugin(
     check_function=check_proxmox_bs,
     check_default_parameters=FILESYSTEM_DEFAULT_LEVELS,
     check_ruleset_name="filesystem",
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Proxmox Client Checks added by:
+# E-Mail: matthias.maderer@web.de
+# License: GPLv2
+
+# convert old pre Checkmk 2.4 parameters to new format
+def params_parser(params):
+    params_new = {}
+
+    for p in params:
+        if params[p] is not None and isinstance(params[p], tuple):
+            if params[p][0] in ("fixed", "no_levels", "predictive"):
+                params_new[p] = params[p]
+            elif isinstance(params[p][0], (int, float)) and isinstance(params[p][1], (int, float)):
+                params_new[p] = ('fixed', (params[p][0], params[p][1]))
+            else:
+                params_new[p] = params[p]
+        else:
+           params_new[p] = params[p]
+
+    return params_new
+
+
+
+
+# generate Service names with this function. -> Get identical names in discovery and check
+def proxmox_bs_gen_clientname(client_json):
+    if "comment" in client_json and "backup-id" in client_json:
+        return str(client_json["backup-id"]) + "-" + str(client_json["comment"])
+
+
+# generate Checkmk Service Items
+def proxmox_bs_clients_discovery(section):
+    if 'data_stores' not in section:
+        return
+
+    clients = []
+
+    #structure results from check output
+    for data_store in section['data_stores']:
+        if 'proxmox-backup-client_snapshot_list' not in section['data_stores'][data_store]:
+            continue
+
+        #collect all clientnames and backup-id's
+        for client_section in section['data_stores'][data_store]['proxmox-backup-client_snapshot_list']:
+            if "comment" in client_section and "backup-id" in client_section:
+                cn = proxmox_bs_gen_clientname(client_section)
+
+                if not cn in clients:
+                    clients.append(cn)
+
+    for client_name in clients:
+        yield Service(
+            item=client_name,
+            #labels=[ServiceLabel('pbs/datastore', 'yes')]
+        )
+
+
+# Example JSON output from check
+#[
+#{
+#    "backup-id":"103",
+#    "backup-time":1742890730,
+#    "backup-type":"vm",
+#    "comment":"pfsense01",
+#    "files":[
+#        {
+#            "crypt-mode":"none",
+#            "filename":"qemu-server.conf.blob",
+#            "size":487
+#        },
+#        {
+#            "crypt-mode":"none",
+#            "filename":"drive-scsi0.img.fidx",
+#            "size":34359738368
+#        },
+#        {
+#            "crypt-mode":"none",
+#            "filename":"index.json.blob",
+#            "size":414
+#        },
+#        {
+#            "filename":"client.log.blob"
+#        }
+#    ],
+#    "owner":"user",
+#    "protected":false,
+#    "size":34359739269
+#},
+#{
+#    "backup-id":"103",
+#    "backup-time":1742550846,
+#    "backup-type":"vm",
+#    "comment":"pfsense01",
+#    "files":[
+#       {
+#           "crypt-mode":"none",
+#           "filename":"qemu-server.conf.blob",
+#           "size":487
+#        },
+#        {
+#            "crypt-mode":"none",
+#            "filename":"drive-scsi0.img.fidx",
+#            "size":34359738368
+#        },
+#        {
+#            "crypt-mode":"none",
+#            "filename":"index.json.blob",
+#            "size":514
+#        },
+#        {
+#            "filename":"client.log.blob"
+#        }
+#    ],
+#    "owner":"user",
+#    "protected":false,
+#    "size":34359739369,
+#    "verification":{
+#        "state":"ok",
+#        "upid":"UPID:pbs:000002C0:000007BA:00000001:67DE4FC4:verificationjob:fs01\\x3av\\x2dee54fa7e\\x2d61f0:root@pam:"
+#    }
+#}
+#]
+
+
+
+# Check function
+def proxmox_bs_clients_checks(item, params, section):
+    clients = {}
+
+    # Only work with new params
+    params_cmk_24 = params_parser(params)
+
+    if 'data_stores' not in section:
+            yield Result(state=State.UNKNOWN, summary=(
+                'No section data_stores found in agent output'
+                ))
+            return
+
+    #structure results from check output
+    for data_store in section['data_stores']:
+        if 'proxmox-backup-client_snapshot_list' not in section['data_stores'][data_store]:
+            yield Result(state=State.UNKNOWN, summary=(
+                'No section proxmox-backup-client_snapshot_list found in agent output'
+                ))
+            return
+
+        for e in section['data_stores'][data_store]['proxmox-backup-client_snapshot_list']:
+            #Get clientname
+            cn = proxmox_bs_gen_clientname(e)
+
+            #Only process do fruther processing for current item
+            if cn != item:
+                continue
+
+            if not cn in clients:
+                clients[cn] = {}
+
+            #Verification states
+            if not "verification" in clients[cn]:
+                clients[cn]["verification"] = {}
+
+                clients[cn]["verification"]["ok"] = {}
+                clients[cn]["verification"]["ok"]["newest_date"] = None
+                clients[cn]["verification"]["ok"]["count"] = 0
+
+                clients[cn]["verification"]["failed"] = {}
+                clients[cn]["verification"]["failed"]["newest_date"] = None
+                clients[cn]["verification"]["failed"]["count"] = 0
+
+                clients[cn]["verification"]["notdone"] = {}
+                clients[cn]["verification"]["notdone"]["newest_date"] = None
+                clients[cn]["verification"]["notdone"]["count"] = 0
+
+            #Backup age
+            dt = int(e["backup-time"])
+
+            if "verification" in e:
+                verify_state = e.get("verification", {}).get("state", "na")
+                if verify_state == "ok":
+                    clients[cn]["verification"]["ok"]["count"] += 1
+                    if clients[cn]["verification"]["ok"]["newest_date"] == None:
+                        clients[cn]["verification"]["ok"]["newest_date"] = dt
+                    elif clients[cn]["verification"]["ok"]["newest_date"] < dt:
+                        clients[cn]["verification"]["ok"]["newest_date"] = dt
+
+                else:
+                    clients[cn]["verification"]["failed"]["count"] += 1
+                    if clients[cn]["verification"]["failed"]["newest_date"] == None:
+                        clients[cn]["verification"]["failed"]["newest_date"] = dt
+                    elif clients[cn]["verification"]["failed"]["newest_date"] < dt:
+                        clients[cn]["verification"]["failed"]["newest_date"] = dt
+            else:
+                    clients[cn]["verification"]["notdone"]["count"] += 1
+                    if clients[cn]["verification"]["notdone"]["newest_date"] == None:
+                        clients[cn]["verification"]["notdone"]["newest_date"] = dt
+                    elif clients[cn]["verification"]["notdone"]["newest_date"] < dt:
+                        clients[cn]["verification"]["notdone"]["newest_date"] = dt
+
+
+        #Process client result and yield results (in the clients array should only be the client matching the item)
+        for cn in clients:
+            if cn != item: #useless, because filtering for the right item is done above. But leave it there for safty.
+                continue
+
+            #OK
+            dpt = ""
+            if clients[cn]["verification"]["ok"]["count"] < params_cmk_24["snapshot_min_ok"]:
+                s=State.WARN
+                dpt= " (minimum of %s backups not reached)" % params_cmk_24["snapshot_min_ok"]
+            elif clients[cn]["verification"]["ok"]["count"] >= params_cmk_24["snapshot_min_ok"]:
+                s=State.OK
+                dpt= ""
+
+            yield Result(state=s, summary=(
+                'Snapshots verify OK: %d%s' % (clients[cn]["verification"]["ok"]["count"],dpt)
+                ))
+
+            #Age Check OK
+            if clients[cn]["verification"]["ok"]["newest_date"] != None:
+                age = int(time.time() - clients[cn]["verification"]["ok"]["newest_date"])
+
+                warn_age, critical_age = params_cmk_24['bkp_age'][1]
+
+                if age >= critical_age:
+                    s = State.CRIT
+                elif age >= warn_age:
+                    s = State.WARN
+                else:
+                    s = State.OK
+
+                yield Result(state=s, summary=(
+                    'Timestamp latest verify OK: %s, Age: %s' % (render.datetime(clients[cn]["verification"]["ok"]["newest_date"]), render.timespan(age))
+                    ))
+            else:
+                s = State.WARN
+                yield Result(state=s, summary=(
+                    'Timestamp latest verify OK: No verified snapshot found'
+                    ))
+
+            #Not verified
+            yield Result(state=State.OK, summary=(
+                'Snapshots verify notdone: %d' % clients[cn]["verification"]["notdone"]["count"]
+                ))
+
+            if clients[cn]["verification"]["notdone"]["newest_date"] != None:
+                age = int(time.time() - clients[cn]["verification"]["notdone"]["newest_date"])
+
+                yield Result(state=State.OK, summary=(
+                    'Timestamp latest unverified: %s, Age: %s' % (render.datetime(clients[cn]["verification"]["notdone"]["newest_date"]), render.timespan(age))
+                    ))
+            else:
+                s = State.WARN
+                yield Result(state=State.OK, summary=(
+                    'Timestamp latest unverified: No unverified snapshot found'
+                    ))
+
+
+            #Failed
+            if clients[cn]["verification"]["failed"]["count"] > 0:
+                s=State.CRIT
+            else:
+                s=State.OK
+
+            yield Result(state=s, summary=(
+                'Snapshots verify failed: %d' % clients[cn]["verification"]["failed"]["count"]
+                ))
+
+
+check_plugin_proxmox_bs_clients = CheckPlugin(
+    name="proxmox_bs_clients",
+    service_name="PBS Client %s",
+    sections=["proxmox_bs"],
+    discovery_function=proxmox_bs_clients_discovery,
+    check_function=proxmox_bs_clients_checks,
+    check_default_parameters={
+                                'bkp_age': ('fixed', (172800, 259200)),
+                                'snapshot_min_ok': 1
+                            },
+    check_ruleset_name="proxmox_bs_clients",
 )
